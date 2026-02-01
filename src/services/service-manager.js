@@ -1,6 +1,5 @@
 import { getServiceAdapter, serviceInstances } from '../providers/adapter.js';
 import { ProviderPoolManager } from '../providers/provider-pool-manager.js';
-import deepmerge from 'deepmerge';
 import * as fs from 'fs';
 import { promises as pfs } from 'fs';
 import * as path from 'path';
@@ -12,9 +11,42 @@ import {
     getFileName,
     formatSystemPath
 } from '../utils/provider-utils.js';
+import { createStorageAdapter, getStorageAdapter, isStorageInitialized } from '../core/storage-factory.js';
 
 // 存储 ProviderPoolManager 实例
 let providerPoolManager = null;
+
+// Storage adapter instance
+let storageAdapter = null;
+
+/**
+ * Initialize the storage adapter (Redis or File based on config).
+ * This should be called early in the startup sequence.
+ * @param {Object} config - The server configuration
+ * @returns {Promise<import('../core/storage-adapter.js').StorageAdapter>}
+ */
+export async function initializeStorageAdapter(config) {
+    if (storageAdapter) {
+        return storageAdapter;
+    }
+
+    storageAdapter = await createStorageAdapter({
+        redis: config.redis,
+        configPath: 'configs/config.json',
+        poolsPath: config.PROVIDER_POOLS_FILE_PATH || 'configs/provider_pools.json',
+    });
+
+    console.log(`[Storage] Initialized storage adapter: ${storageAdapter.getType()}`);
+    return storageAdapter;
+}
+
+/**
+ * Get the current storage adapter instance.
+ * @returns {import('../core/storage-adapter.js').StorageAdapter|null}
+ */
+export function getStorageAdapterInstance() {
+    return storageAdapter;
+}
 
 /**
  * 扫描 configs 目录并自动关联未关联的配置文件到对应的提供商
@@ -26,25 +58,31 @@ export async function autoLinkProviderConfigs(config) {
     if (!config.providerPools) {
         config.providerPools = {};
     }
-    
+
     let totalNewProviders = 0;
     const allNewProviders = {};
-    
+
     // 遍历所有提供商映射
     for (const mapping of PROVIDER_MAPPINGS) {
         const configsPath = path.join(process.cwd(), 'configs', mapping.dirName);
         const { providerType, credPathKey, defaultCheckModel, displayName, needsProjectId } = mapping;
-        
+
+        // 跳过 claude-kiro-oauth：该类型通过 OAuth 流程直接存储到 Redis
+        if (providerType === 'claude-kiro-oauth') {
+            console.log('[Auto-Link] Skipping claude-kiro-oauth (uses Redis directly via OAuth flow)');
+            continue;
+        }
+
         // 确保提供商类型数组存在
         if (!config.providerPools[providerType]) {
             config.providerPools[providerType] = [];
         }
-        
+
         // 检查目录是否存在
         if (!fs.existsSync(configsPath)) {
             continue;
         }
-        
+
         // 获取已关联的配置文件路径集合
         const linkedPaths = new Set();
         for (const provider of config.providerPools[providerType]) {
@@ -53,7 +91,7 @@ export async function autoLinkProviderConfigs(config) {
                 addToUsedPaths(linkedPaths, provider[credPathKey]);
             }
         }
-        
+
         // 递归扫描目录
         const newProviders = [];
         await scanProviderDirectory(configsPath, linkedPaths, newProviders, {
@@ -61,7 +99,7 @@ export async function autoLinkProviderConfigs(config) {
             defaultCheckModel,
             needsProjectId
         });
-        
+
         // 如果有新的配置文件需要关联
         if (newProviders.length > 0) {
             config.providerPools[providerType].push(...newProviders);
@@ -69,13 +107,36 @@ export async function autoLinkProviderConfigs(config) {
             allNewProviders[displayName] = newProviders;
         }
     }
-    
-    // 如果有新的配置文件需要关联，保存更新后的 provider_pools.json
+
+    // 如果有新的配置文件需要关联，保存到 Redis
     if (totalNewProviders > 0) {
-        const filePath = config.PROVIDER_POOLS_FILE_PATH || 'configs/provider_pools.json';
         try {
-            await pfs.writeFile(filePath, JSON.stringify(config.providerPools, null, 2), 'utf8');
-            console.log(`[Auto-Link] Added ${totalNewProviders} new config(s) to provider pools:`);
+            // 使用 Redis 存储适配器保存
+            if (isStorageInitialized()) {
+                const storage = getStorageAdapter();
+                // 为每个新 provider 添加到 Redis
+                let failedCount = 0;
+                for (const [displayName, providers] of Object.entries(allNewProviders)) {
+                    // 找到对应的 providerType
+                    const mapping = PROVIDER_MAPPINGS.find(m => m.displayName === displayName);
+                    if (mapping) {
+                        for (const provider of providers) {
+                            const addResult = await storage.addProvider(mapping.providerType, provider);
+                            if (!addResult.success) {
+                                console.error(`[Auto-Link] Failed to add provider to Redis: ${addResult.error}`);
+                                failedCount++;
+                            }
+                        }
+                    }
+                }
+                if (failedCount > 0) {
+                    console.warn(`[Auto-Link] ${failedCount} provider(s) failed to save to Redis`);
+                }
+                console.log(`[Auto-Link] Added ${totalNewProviders - failedCount} new config(s) to Redis provider pools:`);
+            } else {
+                console.warn('[Auto-Link] Storage not initialized, skipping Redis save');
+            }
+
             for (const [displayName, providers] of Object.entries(allNewProviders)) {
                 console.log(`  ${displayName}: ${providers.length} config(s)`);
                 providers.forEach(p => {
@@ -89,12 +150,12 @@ export async function autoLinkProviderConfigs(config) {
                 });
             }
         } catch (error) {
-            console.error(`[Auto-Link] Failed to save provider_pools.json: ${error.message}`);
+            console.error(`[Auto-Link] Failed to save to Redis: ${error.message}`);
         }
     } else {
         console.log('[Auto-Link] No new configs to link');
     }
-    
+
     // Update provider pool manager if available
     if (providerPoolManager) {
         providerPoolManager.providerPools = config.providerPools;
@@ -167,6 +228,29 @@ async function scanProviderDirectory(dirPath, linkedPaths, newProviders, options
  */
 export async function initApiService(config, isReady = false) {
 
+    // Load provider pools from storage adapter (Redis or File)
+    if (isStorageInitialized()) {
+        const adapter = getStorageAdapter();
+        if (adapter) {
+            try {
+                const pools = await adapter.getProviderPools();
+                if (pools && Object.keys(pools).length > 0) {
+                    config.providerPools = pools;
+                    console.log(`[Initialization] Loaded ${Object.keys(pools).length} provider pool types from ${adapter.getType()} storage`);
+                } else {
+                    console.warn(`[Initialization] Storage adapter returned empty provider pools (${adapter.getType()} mode)`);
+                    config.providerPools = {};
+                }
+            } catch (error) {
+                console.error(`[Initialization] Failed to load provider pools from storage adapter: ${error.message}`);
+                config.providerPools = {};
+            }
+        }
+    } else {
+        console.warn('[Initialization] Storage adapter not initialized, using empty provider pools');
+        config.providerPools = {};
+    }
+
     if (config.providerPools && Object.keys(config.providerPools).length > 0) {
         providerPoolManager = new ProviderPoolManager(config.providerPools, {
             globalConfig: config,
@@ -222,11 +306,14 @@ export async function initApiService(config, isReady = false) {
                 }
                 
                 try {
-                    // 合并全局配置和节点配置
-                    const nodeConfig = deepmerge(config, {
+                    // P1-8: 浅拷贝替代 deepmerge
+                    // 安全性说明：providerConfig 仅包含原始类型值（string/number/boolean），
+                    // 不存在嵌套对象引用，浅拷贝即可满足需求。providerPools 在下方立即删除。
+                    const nodeConfig = {
+                        ...config,
                         ...providerConfig,
                         MODEL_PROVIDER: providerType
-                    });
+                    };
                     delete nodeConfig.providerPools; // 移除 providerPools 避免递归
                     
                     // 初始化服务适配器
@@ -265,8 +352,12 @@ export async function getApiService(config, requestedModel = null, options = {})
         // selectProvider 现在是异步的，使用链式锁确保并发安全
         const selectedProviderConfig = await providerPoolManager.selectProvider(config.MODEL_PROVIDER, requestedModel, { skipUsageCount: true });
         if (selectedProviderConfig) {
-            // 合并选中的提供者配置到当前请求的 config 中
-            serviceConfig = deepmerge(config, selectedProviderConfig);
+            // P1-8: 浅拷贝替代 deepmerge
+            // 安全性说明：selectedProviderConfig 仅包含原始类型值，浅拷贝即可。
+            serviceConfig = {
+                ...config,
+                ...selectedProviderConfig
+            };
             delete serviceConfig.providerPools; // 移除 providerPools 属性
             config.uuid = serviceConfig.uuid;
             config.customName = serviceConfig.customName;
@@ -305,9 +396,13 @@ export async function getApiServiceWithFallback(config, requestedModel = null, o
         
         if (selectedResult) {
             const { config: selectedProviderConfig, actualProviderType: selectedType, isFallback: fallbackUsed, actualModel: fallbackModel } = selectedResult;
-            
-            // 合并选中的提供者配置到当前请求的 config 中
-            serviceConfig = deepmerge(config, selectedProviderConfig);
+
+            // P1-8: 浅拷贝替代 deepmerge
+            // 安全性说明：selectedProviderConfig 仅包含原始类型值，浅拷贝即可。
+            serviceConfig = {
+                ...config,
+                ...selectedProviderConfig
+            };
             delete serviceConfig.providerPools;
             
             actualProviderType = selectedType;

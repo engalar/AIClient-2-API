@@ -1,4 +1,5 @@
 import os from 'os';
+import fs from 'fs';
 import { execSync } from 'child_process';
 
 // CPU 使用率计算相关变量
@@ -6,6 +7,13 @@ let previousCpuInfo = null;
 
 // 进程 CPU 使用率计算相关变量 (PID -> info)
 const processCpuInfoMap = new Map();
+
+// P0-7: Cache for process CPU usage to avoid frequent external process calls
+const processCpuCache = {
+    value: null,
+    timestamp: 0,
+    ttl: 1000  // 1 second cache
+};
 
 /**
  * 获取系统 CPU 使用率百分比
@@ -47,11 +55,18 @@ export function getSystemCpuUsagePercent() {
 
 /**
  * 获取特定进程的 CPU 使用率百分比
+ * P0-7: Add 1-second cache to avoid frequent external process calls (ps/powershell)
  * @param {number} pid - 进程 ID
  * @returns {string} CPU 使用率字符串，如 "5.2%"
  */
 export function getProcessCpuUsagePercent(pid) {
     if (!pid) return '0.0%';
+
+    // P0-7: Check cache first
+    const now = Date.now();
+    if (processCpuCache.value !== null && (now - processCpuCache.timestamp) < processCpuCache.ttl) {
+        return processCpuCache.value;
+    }
 
     try {
         const isWindows = process.platform === 'win32';
@@ -85,18 +100,72 @@ export function getProcessCpuUsagePercent(pid) {
                 });
             }
         } else {
-            // Linux/macOS 使用 ps 命令直接获取
-            const output = execSync(`ps -p ${pid} -o %cpu`, { encoding: 'utf8' });
-            const lines = output.trim().split('\n');
-            if (lines.length >= 2) {
-                cpuPercent = parseFloat(lines[1].trim());
+            // Linux/macOS: 优先使用 /proc 文件系统（兼容 Alpine/BusyBox）
+            const statPath = `/proc/${pid}/stat`;
+            if (fs.existsSync(statPath)) {
+                // 读取 /proc/[pid]/stat 获取 CPU 时间
+                const statContent = fs.readFileSync(statPath, 'utf8');
+                // 格式: pid (comm) state ppid ... utime(14) stime(15) ...
+                // 需要跳过 comm 字段（可能包含空格和括号）
+                const match = statContent.match(/\) \w /);
+                if (match) {
+                    const afterComm = statContent.slice(statContent.indexOf(match[0]) + match[0].length);
+                    const fields = afterComm.trim().split(/\s+/);
+                    // fields[11] = utime (index 11 因为从 state 后开始)
+                    // fields[12] = stime
+                    const utime = parseInt(fields[11], 10) || 0;
+                    const stime = parseInt(fields[12], 10) || 0;
+                    const totalTicks = utime + stime;
+                    const timestamp = Date.now();
+
+                    // 获取系统时钟频率 (通常是 100 Hz)
+                    const clockTicks = 100; // _SC_CLK_TCK 默认值
+
+                    const prevInfo = processCpuInfoMap.get(pid);
+                    if (prevInfo && prevInfo.totalTicks !== undefined) {
+                        const timeDiff = (timestamp - prevInfo.timestamp) / 1000;
+                        const ticksDiff = totalTicks - prevInfo.totalTicks;
+
+                        if (timeDiff > 0) {
+                            const cpuCount = os.cpus().length;
+                            // CPU% = (ticks_diff / clock_ticks) / time_diff * 100 / cpu_count
+                            cpuPercent = (ticksDiff / clockTicks / timeDiff) * 100 / cpuCount;
+                        }
+                    }
+
+                    processCpuInfoMap.set(pid, {
+                        totalTicks,
+                        timestamp
+                    });
+                }
+            } else {
+                // macOS 或其他系统：使用 ps 命令
+                try {
+                    const output = execSync(`ps -p ${pid} -o %cpu=`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+                    cpuPercent = parseFloat(output.trim()) || 0;
+                } catch {
+                    // 进程可能不存在
+                    cpuPercent = 0;
+                }
             }
         }
 
-        return `${Math.max(0, cpuPercent).toFixed(1)}%`;
+        const result = `${Math.max(0, cpuPercent).toFixed(1)}%`;
+
+        // P0-7: Update cache
+        processCpuCache.value = result;
+        processCpuCache.timestamp = Date.now();
+
+        return result;
     } catch (error) {
         // 忽略进程不存在等错误
-        return '0.0%';
+        const fallback = '0.0%';
+
+        // P0-7: Cache error result too to avoid repeated failures
+        processCpuCache.value = fallback;
+        processCpuCache.timestamp = Date.now();
+
+        return fallback;
     }
 }
 

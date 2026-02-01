@@ -11,9 +11,23 @@
 import { promises as fs } from 'fs';
 import { existsSync } from 'fs';
 import path from 'path';
+import { getStorageAdapter, isStorageInitialized } from './storage-factory.js';
 
-// 插件配置文件路径
+// 插件配置文件路径 (fallback)
 const PLUGINS_CONFIG_FILE = path.join(process.cwd(), 'configs', 'plugins.json');
+
+/**
+ * Check if Redis storage is available
+ */
+function isRedisAvailable() {
+    if (!isStorageInitialized()) return false;
+    try {
+        const adapter = getStorageAdapter();
+        return adapter.getType() === 'redis';
+    } catch {
+        return false;
+    }
+}
 
 /**
  * 插件类型常量
@@ -56,12 +70,32 @@ class PluginManager {
         this.pluginsConfig = { plugins: {} };
         /** @type {boolean} */
         this.initialized = false;
+        // P1-11: 缓存已启用的插件列表，避免每次请求都过滤排序
+        /** @type {Plugin[]|null} */
+        this._enabledPluginsCache = null;
     }
 
     /**
-     * 加载插件配置文件
+     * 加载插件配置
+     * 优先从 Redis 读取，fallback 到文件
      */
     async loadConfig() {
+        // Try Redis first
+        if (isRedisAvailable()) {
+            try {
+                const adapter = getStorageAdapter();
+                const config = await adapter.getPlugins();
+                if (config && config.plugins && Object.keys(config.plugins).length > 0) {
+                    this.pluginsConfig = config;
+                    console.log('[PluginManager] Loaded config from Redis');
+                    return;
+                }
+            } catch (error) {
+                console.warn('[PluginManager] Redis error, falling back to file:', error.message);
+            }
+        }
+
+        // Fallback to file
         try {
             if (existsSync(PLUGINS_CONFIG_FILE)) {
                 const content = await fs.readFile(PLUGINS_CONFIG_FILE, 'utf8');
@@ -127,9 +161,23 @@ class PluginManager {
     }
 
     /**
-     * 保存插件配置文件
+     * 保存插件配置
+     * 优先保存到 Redis，fallback 到文件
      */
     async saveConfig() {
+        // Try Redis first
+        if (isRedisAvailable()) {
+            try {
+                const adapter = getStorageAdapter();
+                await adapter.setPlugins(this.pluginsConfig);
+                console.log('[PluginManager] Saved config to Redis');
+                return;
+            } catch (error) {
+                console.warn('[PluginManager] Redis error, falling back to file:', error.message);
+            }
+        }
+
+        // Fallback to file
         try {
             const dir = path.dirname(PLUGINS_CONFIG_FILE);
             if (!existsSync(dir)) {
@@ -154,6 +202,8 @@ class PluginManager {
             return;
         }
         this.plugins.set(plugin.name, plugin);
+        // P1-11: 清除缓存，下次调用时重新计算
+        this._enabledPluginsCache = null;
         console.log(`[PluginManager] Registered plugin: ${plugin.name} v${plugin.version || '1.0.0'}`);
     }
 
@@ -223,19 +273,26 @@ class PluginManager {
      * @returns {Plugin[]}
      */
     getEnabledPlugins() {
-        return Array.from(this.plugins.values())
+        // P1-11: 使用缓存避免每次请求都过滤排序
+        if (this._enabledPluginsCache !== null) {
+            return this._enabledPluginsCache;
+        }
+
+        this._enabledPluginsCache = Array.from(this.plugins.values())
             .filter(p => p._enabled)
             .sort((a, b) => {
                 // 内置插件排在最后
                 const aBuiltin = a._builtin ? 1 : 0;
                 const bBuiltin = b._builtin ? 1 : 0;
                 if (aBuiltin !== bBuiltin) return aBuiltin - bBuiltin;
-                
+
                 // 按优先级排序（数字越小越先执行）
                 const aPriority = a._priority || 100;
                 const bPriority = b._priority || 100;
                 return aPriority - bPriority;
             });
+
+        return this._enabledPluginsCache;
     }
 
     /**
@@ -339,7 +396,7 @@ class PluginManager {
                 if (result.handled) {
                     return { handled: true };
                 }
-                
+
                 // 合并数据
                 if (result.data) {
                     Object.assign(config, result.data);

@@ -4,20 +4,35 @@ import { handleUIApiRequests, serveStaticFiles } from '../services/ui-manager.js
 import { handleAPIRequests } from '../services/api-manager.js';
 import { getApiService, getProviderStatus } from '../services/service-manager.js';
 import { getProviderPoolManager } from '../services/service-manager.js';
-import { MODEL_PROVIDER } from '../utils/common.js';
+import { MODEL_PROVIDER, MODEL_PROVIDER_SET } from '../utils/common.js';
 import { PROMPT_LOG_FILENAME } from '../core/config-manager.js';
 import { handleOllamaRequest, handleOllamaShow } from './ollama-handler.js';
 import { getPluginManager } from '../core/plugin-manager.js';
+import { RequestMetrics } from '../monitoring/index.js';
+
+// P2-17: 缓存日期字符串，避免每次请求都格式化
+let cachedDateString = new Date().toLocaleString();
+let lastDateUpdate = Date.now();
+function getCachedDateString() {
+    const now = Date.now();
+    if (now - lastDateUpdate > 1000) { // 每秒更新一次
+        cachedDateString = new Date().toLocaleString();
+        lastDateUpdate = now;
+    }
+    return cachedDateString;
+}
 
 /**
  * Parse request body as JSON
+ * P0-3: Use Buffer.concat instead of string concatenation to avoid O(n²) complexity
  */
 function parseRequestBody(req) {
     return new Promise((resolve, reject) => {
-        let body = '';
-        req.on('data', chunk => { body += chunk.toString(); });
+        const chunks = [];
+        req.on('data', chunk => { chunks.push(chunk); });
         req.on('end', () => {
             try {
+                const body = Buffer.concat(chunks).toString();
                 resolve(body ? JSON.parse(body) : {});
             } catch (e) {
                 reject(new Error('Invalid JSON in request body'));
@@ -36,8 +51,20 @@ function parseRequestBody(req) {
  */
 export function createRequestHandler(config, providerPoolManager) {
     return async function requestHandler(req, res) {
-        // Deep copy the config for each request to allow dynamic modification
-        const currentConfig = deepmerge({}, config);
+        // P4: Start request tracking for metrics
+        const requestStartTime = Date.now();
+        const requestPath = req.url.split('?')[0]; // Remove query params for grouping
+
+        // P4: Record metrics when response finishes
+        res.on('finish', () => {
+            const latency = Date.now() - requestStartTime;
+            const statusCode = res.statusCode || 200;
+            RequestMetrics.recordRequest(requestPath, req.method, statusCode);
+            RequestMetrics.recordLatency(requestPath, latency);
+        });
+
+        // 浅拷贝配置，只在需要修改时深拷贝特定字段
+        const currentConfig = { ...config };
         const requestUrl = new URL(req.url, `http://${req.headers.host}`);
         let path = requestUrl.pathname;
         const method = req.method;
@@ -77,7 +104,8 @@ export function createRequestHandler(config, providerPoolManager) {
             return true;
         }
 
-        console.log(`\n${new Date().toLocaleString()}`);
+        // P2-17: 使用缓存的日期字符串
+        console.log(`\n${getCachedDateString()}`);
         console.log(`[Server] Received request: ${req.method} http://${req.headers.host}${req.url}`);
 
         // Health check endpoint
@@ -133,23 +161,34 @@ export function createRequestHandler(config, providerPoolManager) {
             console.log(`[Config] MODEL_PROVIDER overridden by header to: ${currentConfig.MODEL_PROVIDER}`);
         }
           
+        // P1-8补充: 优化路径解析 - 延迟 split，只在需要时执行
         // Check if the first path segment matches a MODEL_PROVIDER and switch if it does
         // Note: 'ollama' is not a valid MODEL_PROVIDER, it's a protocol prefix for Ollama API compatibility
-        const pathSegments = path.split('/').filter(segment => segment.length > 0);
-        const isOllamaPath = pathSegments[0] === 'ollama' || path.startsWith('/api/');
-        
-        if (pathSegments.length > 0 && !isOllamaPath) {
-            const firstSegment = pathSegments[0];
-            const isValidProvider = Object.values(MODEL_PROVIDER).includes(firstSegment);
-            if (firstSegment && isValidProvider) {
+        const isOllamaPath = path.startsWith('/ollama/') || path === '/ollama' || path.startsWith('/api/');
+
+        if (!isOllamaPath && path.length > 1) {
+            // 快速提取第一段（避免完整 split）
+            const firstSlash = path.indexOf('/', 1);
+            const firstSegment = firstSlash > 0 ? path.substring(1, firstSlash) : path.substring(1);
+
+            if (firstSegment && MODEL_PROVIDER_SET.has(firstSegment)) { // P0-1: O(1) lookup
                 currentConfig.MODEL_PROVIDER = firstSegment;
                 console.log(`[Config] MODEL_PROVIDER overridden by path segment to: ${currentConfig.MODEL_PROVIDER}`);
-                pathSegments.shift();
-                path = '/' + pathSegments.join('/');
+                // 移除第一段：/provider/rest -> /rest
+                path = firstSlash > 0 ? path.substring(firstSlash) : '/';
                 requestUrl.pathname = path;
-            } else if (firstSegment && !isValidProvider) {
+            } else if (firstSegment && !MODEL_PROVIDER_SET.has(firstSegment)) {
                 console.log(`[Config] Ignoring invalid MODEL_PROVIDER in path segment: ${firstSegment}`);
             }
+        }
+
+        // Kiro 遥测端点：静默返回成功，无需认证
+        // TODO: 研究是否需要将遥测数据转发到真实的 Kiro 服务器
+        // 警告：如果不把遥测数据伪装成 Kiro 会不会导致被封禁？需要进一步研究
+        if (path === '/api/event_logging/batch' || path.startsWith('/api/event_logging')) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true }));
+            return;
         }
 
         // 1. 执行认证流程（只有 type='auth' 的插件参与）

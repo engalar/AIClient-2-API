@@ -3,11 +3,37 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import multer from 'multer';
 
-// Token存储到本地文件中
-const TOKEN_STORE_FILE = path.join(process.cwd(), 'configs', 'token-store.json');
+// P0-6: Global heartbeat timer for all SSE connections (避免每个连接独立定时器)
+let globalHeartbeatTimer = null;
+const sseConnections = new Set();
 
-// 用量缓存文件路径
-const USAGE_CACHE_FILE = path.join(process.cwd(), 'configs', 'usage-cache.json');
+/**
+ * P0-6: Start global heartbeat timer if not already running
+ */
+function startGlobalHeartbeat() {
+    if (!globalHeartbeatTimer) {
+        globalHeartbeatTimer = setInterval(() => {
+            for (const res of sseConnections) {
+                try {
+                    res.write(':\n\n');
+                } catch (err) {
+                    // Connection broken, remove it
+                    sseConnections.delete(res);
+                }
+            }
+        }, 30000);
+    }
+}
+
+/**
+ * P0-6: Stop global heartbeat timer if no connections remain
+ */
+function stopGlobalHeartbeat() {
+    if (sseConnections.size === 0 && globalHeartbeatTimer) {
+        clearInterval(globalHeartbeatTimer);
+        globalHeartbeatTimer = null;
+    }
+}
 
 /**
  * Helper function to broadcast events to UI clients
@@ -26,6 +52,7 @@ export function broadcastEvent(eventType, data) {
 
 /**
  * Server-Sent Events for real-time updates
+ * P0-6: Use global heartbeat timer instead of per-connection timer
  */
 export async function handleEvents(req, res) {
     res.writeHead(200, {
@@ -43,13 +70,14 @@ export async function handleEvents(req, res) {
     }
     global.eventClients.push(res);
 
-    // Keep connection alive
-    const keepAlive = setInterval(() => {
-        res.write(':\n\n');
-    }, 30000);
+    // P0-6: Add to global SSE connections set
+    sseConnections.add(res);
+    startGlobalHeartbeat();
 
     req.on('close', () => {
-        clearInterval(keepAlive);
+        // P0-6: Remove from global set and stop timer if needed
+        sseConnections.delete(res);
+        stopGlobalHeartbeat();
         global.eventClients = global.eventClients.filter(r => r !== res);
     });
 
@@ -58,6 +86,7 @@ export async function handleEvents(req, res) {
 
 /**
  * Initialize UI management features
+ * 优化版本：添加日志采样和批量广播，减��CPU占用
  */
 export function initializeUIManagement() {
     // Initialize log broadcasting for UI
@@ -67,59 +96,144 @@ export function initializeUIManagement() {
     if (!global.logBuffer) {
         global.logBuffer = [];
     }
+    if (!global.logBroadcastPending) {
+        global.logBroadcastPending = false;
+    }
+    if (!global.pendingLogs) {
+        global.pendingLogs = [];
+    }
+
+    // 日志采样率（可通过环境变量配置）
+    const BASE_LOG_SAMPLE_RATE = parseFloat(process.env.LOG_SAMPLE_RATE || '1.0');
+    const BATCH_BROADCAST_DELAY = parseInt(process.env.LOG_BATCH_DELAY || '100'); // 100ms批量广播
+
+    // P3 Fix: High concurrency adaptive log throttling
+    // Track request rate to automatically reduce logging under load
+    let logCountInWindow = 0;
+    let windowStartTime = Date.now();
+    const LOG_WINDOW_MS = 1000; // 1 second window
+    const HIGH_LOAD_THRESHOLD = parseInt(process.env.LOG_HIGH_LOAD_THRESHOLD || '50'); // logs per second threshold
+    const HIGH_LOAD_SAMPLE_RATE = parseFloat(process.env.LOG_HIGH_LOAD_SAMPLE_RATE || '0.1'); // 10% sampling under high load
+
+    /**
+     * P3 Fix: Get adaptive sample rate based on current load
+     */
+    function getAdaptiveSampleRate() {
+        const now = Date.now();
+
+        // Reset window if expired
+        if (now - windowStartTime > LOG_WINDOW_MS) {
+            logCountInWindow = 0;
+            windowStartTime = now;
+        }
+
+        logCountInWindow++;
+
+        // Under high load, reduce sample rate
+        if (logCountInWindow > HIGH_LOAD_THRESHOLD) {
+            return Math.min(BASE_LOG_SAMPLE_RATE, HIGH_LOAD_SAMPLE_RATE);
+        }
+
+        return BASE_LOG_SAMPLE_RATE;
+    }
+
+    /**
+     * 批量广播日志，减少广播频率
+     */
+    function scheduleBatchBroadcast() {
+        if (global.logBroadcastPending) {
+            return;
+        }
+
+        global.logBroadcastPending = true;
+        setTimeout(() => {
+            if (global.pendingLogs.length > 0) {
+                // 批量广播最近的日志
+                const logsToSend = global.pendingLogs.slice(-10);
+                broadcastEvent('log_batch', logsToSend);
+                global.pendingLogs = [];
+            }
+            global.logBroadcastPending = false;
+        }, BATCH_BROADCAST_DELAY);
+    }
 
     // Override console.log to broadcast logs
     const originalLog = console.log;
     console.log = function(...args) {
         originalLog.apply(console, args);
-        const message = args.map(arg => {
-            if (typeof arg === 'string') return arg;
-            try {
-                return JSON.stringify(arg);
-            } catch (e) {
-                if (arg instanceof Error) {
-                    return `[Error: ${arg.message}] ${arg.stack || ''}`;
-                }
-                return `[Object: ${Object.prototype.toString.call(arg)}] (Circular or too complex to stringify)`;
-            }
-        }).join(' ');
-        const logEntry = {
-            timestamp: new Date().toISOString(),
-            level: 'info',
-            message: message
-        };
-        global.logBuffer.push(logEntry);
-        if (global.logBuffer.length > 100) {
-            global.logBuffer.shift();
+
+        // P3 Fix: Use adaptive sample rate based on current load
+        const sampleRate = getAdaptiveSampleRate();
+        if (Math.random() > sampleRate) {
+            return;
         }
-        broadcastEvent('log', logEntry);
+
+        // 使用 setImmediate 异步处理日志，避免阻塞主线程
+        setImmediate(() => {
+            const message = args.map(arg => {
+                if (typeof arg === 'string') return arg;
+                try {
+                    return JSON.stringify(arg);
+                } catch (e) {
+                    if (arg instanceof Error) {
+                        return `[Error: ${arg.message}]`;
+                    }
+                    return '[Complex Object]';
+                }
+            }).join(' ');
+
+            const logEntry = {
+                timestamp: new Date().toISOString(),
+                level: 'info',
+                message: message
+            };
+
+            global.logBuffer.push(logEntry);
+            if (global.logBuffer.length > 100) {
+                global.logBuffer.shift();
+            }
+
+            // 添加到待广播队列
+            global.pendingLogs.push(logEntry);
+
+            // 调度批量广播
+            scheduleBatchBroadcast();
+        });
     };
 
     // Override console.error to broadcast errors
     const originalError = console.error;
     console.error = function(...args) {
         originalError.apply(console, args);
-        const message = args.map(arg => {
-            if (typeof arg === 'string') return arg;
-            try {
-                return JSON.stringify(arg);
-            } catch (e) {
-                if (arg instanceof Error) {
-                    return `[Error: ${arg.message}] ${arg.stack || ''}`;
+
+        // 错误日志始终记录，不采样
+        setImmediate(() => {
+            const message = args.map(arg => {
+                if (typeof arg === 'string') return arg;
+                try {
+                    return JSON.stringify(arg);
+                } catch (e) {
+                    if (arg instanceof Error) {
+                        return `[Error: ${arg.message}] ${arg.stack || ''}`;
+                    }
+                    return '[Complex Object]';
                 }
-                return `[Object: ${Object.prototype.toString.call(arg)}] (Circular or too complex to stringify)`;
+            }).join(' ');
+
+            const logEntry = {
+                timestamp: new Date().toISOString(),
+                level: 'error',
+                message: message
+            };
+
+            global.logBuffer.push(logEntry);
+            if (global.logBuffer.length > 100) {
+                global.logBuffer.shift();
             }
-        }).join(' ');
-        const logEntry = {
-            timestamp: new Date().toISOString(),
-            level: 'error',
-            message: message
-        };
-        global.logBuffer.push(logEntry);
-        if (global.logBuffer.length > 100) {
-            global.logBuffer.shift();
-        }
-        broadcastEvent('log', logEntry);
+
+            // 错误日志立即广播
+            broadcastEvent('log', logEntry);
+        });
     };
 }
 

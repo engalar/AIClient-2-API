@@ -5,6 +5,15 @@ import * as crypto from 'crypto'; // Import crypto for MD5 hashing
 import { convertData, getOpenAIStreamChunkStop } from '../convert/convert.js';
 import { ProviderStrategyFactory } from './provider-strategies.js';
 import { getPluginManager } from '../core/plugin-manager.js';
+import { getCachedServiceManager } from './import-cache.js';
+
+// P1-9补充: 缓存序列化的 stop chunk，避免每次流式响应都重新序列化
+// 添加大小限制防止内存泄漏（最多缓存 100 个模型的 stop chunk）
+const stopChunkCache = new Map();
+const STOP_CHUNK_CACHE_MAX_SIZE = 100;
+
+// P0-3: Export cached service manager getter for testing
+export const _getServiceManagerCached = getCachedServiceManager;
 
 // ==================== 网络错误处理 ====================
 
@@ -73,6 +82,12 @@ export const MODEL_PROVIDER = {
     FORWARD_API: 'forward-api',
 }
 
+// P0-1: Cache MODEL_PROVIDER values as Set for O(1) lookup
+export const MODEL_PROVIDER_SET = new Set(Object.values(MODEL_PROVIDER));
+
+// P0-2: Map cache for getProtocolPrefix to avoid redundant string operations
+const protocolPrefixCache = new Map();
+
 /**
  * Extracts the protocol prefix from a given model provider string.
  * This is used to determine if two providers belong to the same underlying protocol (e.g., gemini, openai, claude).
@@ -80,16 +95,24 @@ export const MODEL_PROVIDER = {
  * @returns {string} The protocol prefix (e.g., 'gemini', 'openai', 'claude').
  */
 export function getProtocolPrefix(provider) {
-    // Special case for Codex - it needs its own protocol
-    if (provider === 'openai-codex-oauth') {
-        return 'codex';
+    // Check cache first
+    if (protocolPrefixCache.has(provider)) {
+        return protocolPrefixCache.get(provider);
     }
 
-    const hyphenIndex = provider.indexOf('-');
-    if (hyphenIndex !== -1) {
-        return provider.substring(0, hyphenIndex);
+    // Compute prefix
+    let prefix;
+    // Special case for Codex - it needs its own protocol
+    if (provider === 'openai-codex-oauth') {
+        prefix = 'codex';
+    } else {
+        const hyphenIndex = provider.indexOf('-');
+        prefix = hyphenIndex !== -1 ? provider.substring(0, hyphenIndex) : provider;
     }
-    return provider; // Return original if no hyphen is found
+
+    // Cache and return
+    protocolPrefixCache.set(provider, prefix);
+    return prefix;
 }
 
 export const ENDPOINT_TYPE = {
@@ -166,26 +189,48 @@ export function formatExpiryLog(tag, expiryDate, nearMinutes) {
 
 /**
  * Reads the entire request body from an HTTP request.
+ * 优化版本：使用数组存储chunks，避免字符串拼接导致的内存碎片
+ * P2-2: 移除 setImmediate，直接同步解析 JSON
+ * 原因：setImmediate 增加 1-4ms 延迟，对于大多数请求得不偿失
+ * 现代 V8 的 JSON.parse 已经非常高效，同步解析更快
  * @param {http.IncomingMessage} req - The HTTP request object.
+ * @param {number} maxSize - Maximum request body size in bytes (default: 10MB)
  * @returns {Promise<Object>} A promise that resolves with the parsed JSON request body.
- * @throws {Error} If the request body is not valid JSON.
+ * @throws {Error} If the request body is not valid JSON or exceeds size limit.
  */
-export function getRequestBody(req) {
+export function getRequestBody(req, maxSize = 10 * 1024 * 1024) {
     return new Promise((resolve, reject) => {
-        let body = '';
+        const chunks = [];
+        let totalSize = 0;
+
         req.on('data', chunk => {
-            body += chunk.toString();
+            totalSize += chunk.length;
+
+            // 检查大小限制，防止内存溢出
+            if (totalSize > maxSize) {
+                req.destroy();
+                reject(new Error(`Request body too large (max: ${maxSize} bytes ${totalSize} bytes)`));
+                return;
+            }
+
+            chunks.push(chunk);
         });
+
         req.on('end', () => {
-            if (!body) {
+            if (chunks.length === 0) {
                 return resolve({});
             }
+
             try {
+                // 使用 Buffer.concat 而不是字符串拼接，避免内存碎片
+                const body = Buffer.concat(chunks).toString('utf8');
+                // P2-2: 直接同步解析，避免 setImmediate 带来的延迟
                 resolve(JSON.parse(body));
             } catch (error) {
-                reject(new Error("Invalid JSON in request body."));
+                reject(new Error("Invalid JSON in request body: " + error.message));
             }
         });
+
         req.on('error', err => {
             reject(err);
         });
@@ -272,8 +317,8 @@ export async function handleUnifiedResponse(res, responsePayload, isStream) {
     }
 }
 
-export async function handleStreamRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName, retryContext = null) {
-    let fullResponseText = '';
+export async function handleStreamRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName, retryContext) {
+    const textChunks = [];  // 使用数组存储文本，避免字符串拼接
     let fullResponseJson = '';
     let fullOldResponseJson = '';
     let responseClosed = false;
@@ -299,11 +344,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     const openStop = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI ;
 
     try {
+        let chunkCount = 0;
         for await (const nativeChunk of nativeStream) {
             // Extract text for logging purposes
             const chunkText = extractResponseText(nativeChunk, toProvider);
             if (chunkText && !Array.isArray(chunkText)) {
-                fullResponseText += chunkText;
+                textChunks.push(chunkText);  // 使用数组存储，避免字符串拼接
             }
 
             // Convert the complete chunk object to the client's format (fromProvider), if necessary.
@@ -326,15 +372,32 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     // console.log(`event: ${chunk.type}\n`);
                 }
 
-                // fullOldResponseJson += JSON.stringify(chunk)+"\n";
-                // fullResponseJson += JSON.stringify(chunk)+"\n\n";
-                res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                // console.log(`data: ${JSON.stringify(chunk)}\n`);
+                // 预先序列化，避免在循环中重复序列化相同的对象
+                const serialized = JSON.stringify(chunk);
+                // fullOldResponseJson += serialized+"\n";
+                // fullResponseJson += serialized+"\n\n";
+                res.write(`data: ${serialized}\n\n`);
+                // console.log(`data: ${serialized}\n`);
+            }
+
+            // 每处理10个chunk让出一次CPU，避免长时间阻塞事件循环
+            chunkCount++;
+            if (chunkCount % 10 === 0) {
+                await new Promise(resolve => setImmediate(resolve));
             }
         }
+        // P1-9补充: 使用缓存的序列化 stop chunk
         if (openStop && needsConversion) {
-            res.write(`data: ${JSON.stringify(getOpenAIStreamChunkStop(model))}\n\n`);
-            // console.log(`data: ${JSON.stringify(getOpenAIStreamChunkStop(model))}\n`);
+            let serializedStopChunk = stopChunkCache.get(model);
+            if (!serializedStopChunk) {
+                serializedStopChunk = JSON.stringify(getOpenAIStreamChunkStop(model));
+                // 防止缓存无限增长：超过限制时清空缓存
+                if (stopChunkCache.size >= STOP_CHUNK_CACHE_MAX_SIZE) {
+                    stopChunkCache.clear();
+                }
+                stopChunkCache.set(model, serializedStopChunk);
+            }
+            res.write(`data: ${serializedStopChunk}\n\n`);
         }
 
         // 流式请求成功完成，统计使用次数，错误次数重置为0
@@ -350,8 +413,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         console.error('\n[Server] Error during stream processing:', error.stack);
         
         // 如果已经发送了内容，不进行重试（避免响应数据损坏）
-        if (fullResponseText.length > 0) {
-            console.log(`[Stream Retry] Cannot retry: ${fullResponseText.length} bytes already sent to client`);
+        if (textChunks.length > 0) {
+            const sentBytes = textChunks.join('').length;
+            console.log(`[Stream Retry] Cannot retry: ${sentBytes} bytes already sent to client`);
             // 直接发送错误并结束
             const errorPayload = createStreamErrorResponse(error, fromProvider);
             res.write(errorPayload);
@@ -404,13 +468,13 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             await new Promise(resolve => setTimeout(resolve, randomDelay));
             
             try {
-                // 动态导入以避免循环依赖
-                const { getApiServiceWithFallback } = await import('../services/service-manager.js');
+                // P0-3: 使用缓存的导入，避免热路径中重复动态导入
+                const { getApiServiceWithFallback } = await getCachedServiceManager();
                 const result = await getApiServiceWithFallback(CONFIG, model);
-                
+
                 if (result && result.service && result.uuid !== pooluuid) {
                     console.log(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
-                    
+
                     // 使用新服务重试
                     const newRetryContext = {
                         ...retryContext,
@@ -418,7 +482,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         currentRetry: currentRetry + 1,
                         maxRetries
                     };
-                    
+
                     // 递归调用，使用新的服务
                     return await handleStreamRequest(
                         res,
@@ -453,6 +517,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (!responseClosed) {
             res.end();
         }
+        // 最后拼接所有文本块，避免在循环中频繁拼接
+        const fullResponseText = textChunks.join('');
         await logConversation('output', fullResponseText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
         // fs.writeFile('oldResponseChunk'+Date.now()+'.json', fullOldResponseJson);
         // fs.writeFile('responseChunk'+Date.now()+'.json', fullResponseJson);
@@ -532,7 +598,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         if (shouldSwitchCredential && !credentialMarkedUnhealthy) {
             credentialMarkedUnhealthy = true; // 触发下面的重试逻辑
         }
-        
+
         // 凭证已被标记为不健康后，尝试切换到新凭证重试
         // 不再依赖状态码判断，只要凭证被标记不健康且可以重试，就尝试切换
         if (credentialMarkedUnhealthy && currentRetry < maxRetries && providerPoolManager && CONFIG) {
@@ -540,15 +606,15 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
             const randomDelay = Math.floor(Math.random() * 10000); // 0-10000毫秒
             console.log(`[Unary Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
             await new Promise(resolve => setTimeout(resolve, randomDelay));
-            
+
             try {
-                // 动态导入以避免循环依赖
-                const { getApiServiceWithFallback } = await import('../services/service-manager.js');
+                // P0-3: 使用缓存的导入，避免热路径中重复动态导入
+                const { getApiServiceWithFallback } = await getCachedServiceManager();
                 const result = await getApiServiceWithFallback(CONFIG, model);
-                
+
                 if (result && result.service && result.uuid !== pooluuid) {
                     console.log(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
-                    
+
                     // 使用新服务重试
                     const newRetryContext = {
                         ...retryContext,
@@ -556,7 +622,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                         currentRetry: currentRetry + 1,
                         maxRetries
                     };
-                    
+
                     // 递归调用，使用新的服务
                     return await handleUnaryRequest(
                         res,

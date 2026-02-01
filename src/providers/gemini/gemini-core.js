@@ -10,8 +10,10 @@ import { API_ACTIONS, formatExpiryTime, isRetryableNetworkError, formatExpiryLog
 import { getProviderModels } from '../provider-models.js';
 import { handleGeminiCliOAuth } from '../../auth/oauth-handlers.js';
 import { getProxyConfigForProvider, getGoogleAuthProxyConfig } from '../../utils/proxy-utils.js';
+import { normalizeGeminiUsage } from '../../converters/usage/index.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
 import { MODEL_PROVIDER } from '../../utils/common.js';
+import { getStorageAdapter, isStorageInitialized } from '../../core/storage-factory.js';
 
 // 配置 HTTP/HTTPS agent 限制连接池大小，避免资源泄漏
 const httpAgent = new http.Agent({
@@ -56,7 +58,9 @@ function extract_model_from_anti_model(model) {
 function toGeminiApiResponse(codeAssistResponse) {
     if (!codeAssistResponse) return null;
     const compliantResponse = { candidates: codeAssistResponse.candidates };
-    if (codeAssistResponse.usageMetadata) compliantResponse.usageMetadata = codeAssistResponse.usageMetadata;
+    if (codeAssistResponse.usageMetadata) {
+        compliantResponse.usageMetadata = normalizeGeminiUsage(codeAssistResponse.usageMetadata);
+    }
     if (codeAssistResponse.promptFeedback) compliantResponse.promptFeedback = codeAssistResponse.promptFeedback;
     if (codeAssistResponse.automaticFunctionCallingHistory) compliantResponse.automaticFunctionCallingHistory = codeAssistResponse.automaticFunctionCallingHistory;
     return compliantResponse;
@@ -254,8 +258,37 @@ export class GeminiApiService {
 
     /**
      * 加载凭证信息（不执行刷新）
+     * Tries Redis first, then falls back to base64 or file storage
      */
     async loadCredentials() {
+        // Try loading from Redis first
+        const loadFromRedis = async () => {
+            if (!isStorageInitialized() || !this.uuid) {
+                return null;
+            }
+            try {
+                const adapter = getStorageAdapter();
+                if (adapter.getType() === 'redis') {
+                    const token = await adapter.getToken('gemini-cli-oauth', this.uuid);
+                    if (token) {
+                        console.info(`[Gemini Auth] Loaded credentials from Redis for ${this.uuid}`);
+                        return token;
+                    }
+                }
+            } catch (error) {
+                console.debug(`[Gemini Auth] Failed to load from Redis: ${error.message}`);
+            }
+            return null;
+        };
+
+        // Try Redis first
+        const redisCredentials = await loadFromRedis();
+        if (redisCredentials) {
+            this.authClient.setCredentials(redisCredentials);
+            return;
+        }
+
+        // Try base64 encoded credentials
         if (this.oauthCredsBase64) {
             try {
                 const decoded = Buffer.from(this.oauthCredsBase64, 'base64').toString('utf8');
@@ -268,6 +301,7 @@ export class GeminiApiService {
             }
         }
 
+        // Fall back to file storage
         const credPath = this.oauthCredsFilePath || path.join(os.homedir(), CREDENTIALS_DIR, CREDENTIALS_FILE);
         try {
             const data = await fs.readFile(credPath, "utf8");
@@ -627,12 +661,24 @@ export class GeminiApiService {
         for await (const line of rl) {
             if (line.startsWith("data: ")) buffer.push(line.slice(6));
             else if (line === "" && buffer.length > 0) {
-                try { yield JSON.parse(buffer.join('\n')); } catch (e) { console.error("[Stream] Failed to parse JSON chunk:", buffer.join('\n')); }
+                // P2-16: 优化 join - 单行时直接使用，避免 join 调用
+                const jsonStr = buffer.length === 1 ? buffer[0] : buffer.join('\n');
+                try {
+                    yield JSON.parse(jsonStr);
+                } catch (e) {
+                    console.error("[Stream] Failed to parse JSON chunk:", jsonStr);
+                }
                 buffer = [];
             }
         }
         if (buffer.length > 0) {
-            try { yield JSON.parse(buffer.join('\n')); } catch (e) { console.error("[Stream] Failed to parse final JSON chunk:", buffer.join('\n')); }
+            // P2-16: 优化 join - 单行时直接使用
+            const jsonStr = buffer.length === 1 ? buffer[0] : buffer.join('\n');
+            try {
+                yield JSON.parse(jsonStr);
+            } catch (e) {
+                console.error("[Stream] Failed to parse final JSON chunk:", jsonStr);
+            }
         }
     }
 
@@ -715,11 +761,65 @@ export class GeminiApiService {
     }
 
     /**
-     * 保存凭证到文件
+     * 保存凭证到文件and Redis
      * @param {string} filePath - 凭证文件路径
      * @param {Object} credentials - 凭证数据
      */
     async _saveCredentialsToFile(filePath, credentials) {
+        // Try saving to Redis first with atomic update
+        const saveToRedis = async () => {
+            if (!isStorageInitialized() || !this.uuid) {
+                return false;
+            }
+            try {
+                const adapter = getStorageAdapter();
+                if (adapter.getType() === 'redis') {
+                    // Get the old refresh token for atomic update comparison
+                    const oldCredentials = this.authClient.credentials;
+                    const expectedRefreshToken = oldCredentials?.refresh_token || '';
+
+                    // Calculate TTL based on expiry_date if available
+                    let ttl = 0;
+                    if (credentials.expiry_date) {
+                        const expiryMs = typeof credentials.expiry_date === 'number'
+                            ? credentials.expiry_date
+                            : new Date(credentials.expiry_date).getTime();
+                        ttl = Math.max(0, Math.floor((expiryMs - Date.now()) / 1000) + 3600); // Add 1 hour buffer
+                    }
+
+                    // Use atomic update to prevent concurrent refresh conflicts
+                    if (adapter.atomicTokenUpdate) {
+                        const success = await adapter.atomicTokenUpdate(
+                            'gemini-cli-oauth',
+                            this.uuid,
+                            credentials,
+                            expectedRefreshToken,
+                            ttl
+                        );
+                        if (success) {
+                            console.info(`[Gemini Auth] Credentials saved to Redis atomically for ${this.uuid}`);
+                            return true;
+                        } else {
+                            console.warn(`[Gemini Auth] Atomic update detected conflict, another process may have refreshed`);
+                            return false;
+                        }
+                    } else {
+                        // Fall back to regular setToken
+                        await adapter.setToken('gemini-cli-oauth', this.uuid, credentials, ttl);
+                        console.info(`[Gemini Auth] Credentials saved to Redis for ${this.uuid}`);
+                        return true;
+                    }
+                }
+            } catch (error) {
+                console.warn(`[Gemini Auth] Failed to save to Redis: ${error.message}`);
+            }
+            return false;
+        };
+
+        // Save to Redis
+        await saveToRedis();
+
+        // Always save to file as backup
         try {
             await fs.writeFile(filePath, JSON.stringify(credentials, null, 2));
             console.log(`[Gemini Auth] Credentials saved to ${filePath}`);
