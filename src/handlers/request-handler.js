@@ -8,6 +8,7 @@ import { MODEL_PROVIDER, MODEL_PROVIDER_SET } from '../utils/common.js';
 import { PROMPT_LOG_FILENAME } from '../core/config-manager.js';
 import { handleOllamaRequest, handleOllamaShow } from './ollama-handler.js';
 import { getPluginManager } from '../core/plugin-manager.js';
+import { RequestMetrics } from '../monitoring/index.js';
 
 // P2-17: 缓存日期字符串，避免每次请求都格式化
 let cachedDateString = new Date().toLocaleString();
@@ -50,6 +51,18 @@ function parseRequestBody(req) {
  */
 export function createRequestHandler(config, providerPoolManager) {
     return async function requestHandler(req, res) {
+        // P4: Start request tracking for metrics
+        const requestStartTime = Date.now();
+        const requestPath = req.url.split('?')[0]; // Remove query params for grouping
+
+        // P4: Record metrics when response finishes
+        res.on('finish', () => {
+            const latency = Date.now() - requestStartTime;
+            const statusCode = res.statusCode || 200;
+            RequestMetrics.recordRequest(requestPath, req.method, statusCode);
+            RequestMetrics.recordLatency(requestPath, latency);
+        });
+
         // 浅拷贝配置，只在需要修改时深拷贝特定字段
         const currentConfig = { ...config };
         const requestUrl = new URL(req.url, `http://${req.headers.host}`);
