@@ -323,6 +323,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     let fullOldResponseJson = '';
     let responseClosed = false;
     
+    // P4 Optimization: Check logging mode once
+    const shouldLog = PROMPT_LOG_MODE !== 'none';
+
     // 重试上下文：包含 CONFIG 和重试计数
     // maxRetries: 凭证切换最大次数（跨凭证），默认 5 次
     const maxRetries = retryContext?.maxRetries ?? 5;
@@ -344,12 +347,28 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     const openStop = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI ;
 
     try {
-        let chunkCount = 0;
+        // P5 Optimization: Time-based CPU yielding instead of fixed chunk count
+        // This reduces unnecessary context switches while still preventing event loop blocking
+        let lastYieldTime = Date.now();
+        const YIELD_THRESHOLD_MS = 50; // Only yield if processing takes longer than 50ms
+
+        // P5 Optimization: Batch writes using cork/uncork to reduce system calls
+        const socket = res.socket;
+        const supportsCork = socket && typeof socket.cork === 'function' && typeof socket.uncork === 'function';
+        let batchWriteCount = 0;
+        const BATCH_SIZE = 5; // Uncork after every 5 writes
+
+        if (supportsCork) {
+            socket.cork();
+        }
+
         for await (const nativeChunk of nativeStream) {
-            // Extract text for logging purposes
-            const chunkText = extractResponseText(nativeChunk, toProvider);
-            if (chunkText && !Array.isArray(chunkText)) {
-                textChunks.push(chunkText);  // 使用数组存储，避免字符串拼接
+            // P4 Optimization: Only extract text for logging if logging is actually enabled
+            if (shouldLog) {
+                const chunkText = extractResponseText(nativeChunk, toProvider);
+                if (chunkText && !Array.isArray(chunkText)) {
+                    textChunks.push(chunkText);  // 使用数组存储，避免字符串拼接
+                }
             }
 
             // Convert the complete chunk object to the client's format (fromProvider), if necessary.
@@ -366,25 +385,34 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
             for (const chunk of chunksToSend) {
                 if (addEvent) {
-                    // fullOldResponseJson += chunk.type+"\n";
-                    // fullResponseJson += chunk.type+"\n";
                     res.write(`event: ${chunk.type}\n`);
-                    // console.log(`event: ${chunk.type}\n`);
                 }
 
                 // 预先序列化，避免在循环中重复序列化相同的对象
                 const serialized = JSON.stringify(chunk);
-                // fullOldResponseJson += serialized+"\n";
-                // fullResponseJson += serialized+"\n\n";
                 res.write(`data: ${serialized}\n\n`);
-                // console.log(`data: ${serialized}\n`);
+                batchWriteCount++;
             }
 
-            // 每处理10个chunk让出一次CPU，避免长时间阻塞事件循环
-            chunkCount++;
-            if (chunkCount % 10 === 0) {
-                await new Promise(resolve => setImmediate(resolve));
+            // P5 Optimization: Uncork after batch size to flush writes
+            if (supportsCork && batchWriteCount >= BATCH_SIZE) {
+                socket.uncork();
+                socket.cork();
+                batchWriteCount = 0;
             }
+
+            // P5 Optimization: Time-based yielding - only yield if processing exceeds threshold
+            // This dramatically reduces unnecessary setImmediate calls in fast scenarios
+            const now = Date.now();
+            if (now - lastYieldTime > YIELD_THRESHOLD_MS) {
+                await new Promise(resolve => setImmediate(resolve));
+                lastYieldTime = now;
+            }
+        }
+
+        // Final uncork to flush any remaining buffered writes
+        if (supportsCork) {
+            socket.uncork();
         }
         // P1-9补充: 使用缓存的序列化 stop chunk
         if (openStop && needsConversion) {
@@ -517,9 +545,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (!responseClosed) {
             res.end();
         }
-        // 最后拼接所有文本块，避免在循环中频繁拼接
-        const fullResponseText = textChunks.join('');
-        await logConversation('output', fullResponseText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
+        // P4 Optimization: Only log if enabled
+        if (shouldLog) {
+            // 最后拼接所有文本块，避免在循环中频繁拼接
+            const fullResponseText = textChunks.join('');
+            await logConversation('output', fullResponseText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
+        }
         // fs.writeFile('oldResponseChunk'+Date.now()+'.json', fullOldResponseJson);
         // fs.writeFile('responseChunk'+Date.now()+'.json', fullResponseJson);
     }
@@ -533,13 +564,21 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
     const currentRetry = retryContext?.currentRetry ?? 0;
     const CONFIG = retryContext?.CONFIG;
     
+    // P4 Optimization: Check logging mode once
+    const shouldLog = PROMPT_LOG_MODE !== 'none';
+
     try{
         // The service returns the response in its native format (toProvider).
         const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
         requestBody.model = model;
         // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
         const nativeResponse = await service.generateContent(model, requestBody);
-        const responseText = extractResponseText(nativeResponse, toProvider);
+        
+        // P4 Optimization: Only extract text for logging if logging is actually enabled
+        let responseText = '';
+        if (shouldLog) {
+            responseText = extractResponseText(nativeResponse, toProvider);
+        }
 
         // Convert the response back to the client's format (fromProvider), if necessary.
         let clientResponse = nativeResponse;
@@ -550,7 +589,11 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
 
         //console.log(`[Response] Sending response to client: ${JSON.stringify(clientResponse)}`);
         await handleUnifiedResponse(res, JSON.stringify(clientResponse), false);
-        await logConversation('output', responseText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
+        
+        // P4 Optimization: Only log if enabled
+        if (shouldLog) {
+            await logConversation('output', responseText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
+        }
         // fs.writeFile('oldResponse'+Date.now()+'.json', JSON.stringify(clientResponse));
         
         // 一元请求成功完成，统计使用次数，错误次数重置为0

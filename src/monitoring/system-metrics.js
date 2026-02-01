@@ -13,7 +13,7 @@
 import os from 'os';
 
 // MEDIUM-1 fix: Extract magic numbers to named constants
-const EVENT_LOOP_CHECK_INTERVAL_MS = 100;
+const EVENT_LOOP_CHECK_INTERVAL_MS = 1000;
 const EVENT_LOOP_LAG_THRESHOLD_MULTIPLIER = 1.5;
 const EVENT_LOOP_LAG_DECAY_FACTOR = 0.9;
 
@@ -183,6 +183,80 @@ export const SystemMetrics = {
     startEventLoopMonitoring,
     stopEventLoopMonitoring,
     reset
+};
+
+/**
+ * Stream-specific metrics for monitoring streaming performance
+ * P5: Added for CPU performance optimization tracking
+ */
+const streamMetricsState = {
+    activeStreams: 0,
+    totalStreamsCompleted: 0,
+    totalChunksProcessed: 0,
+    totalProcessingTimeMs: 0,
+    avgChunkProcessingTimeMs: 0,
+    peakActiveStreams: 0,
+    lastResetTime: Date.now()
+};
+
+export const StreamMetrics = {
+    /**
+     * Record start of a new stream
+     */
+    streamStarted() {
+        streamMetricsState.activeStreams++;
+        if (streamMetricsState.activeStreams > streamMetricsState.peakActiveStreams) {
+            streamMetricsState.peakActiveStreams = streamMetricsState.activeStreams;
+        }
+    },
+
+    /**
+     * Record end of a stream
+     * @param {number} chunksProcessed - Number of chunks in this stream
+     * @param {number} processingTimeMs - Total processing time for this stream
+     */
+    streamEnded(chunksProcessed = 0, processingTimeMs = 0) {
+        streamMetricsState.activeStreams = Math.max(0, streamMetricsState.activeStreams - 1);
+        streamMetricsState.totalStreamsCompleted++;
+        streamMetricsState.totalChunksProcessed += chunksProcessed;
+        streamMetricsState.totalProcessingTimeMs += processingTimeMs;
+
+        // Update rolling average
+        if (streamMetricsState.totalChunksProcessed > 0) {
+            streamMetricsState.avgChunkProcessingTimeMs =
+                streamMetricsState.totalProcessingTimeMs / streamMetricsState.totalChunksProcessed;
+        }
+    },
+
+    /**
+     * Get current stream metrics
+     * @returns {Object} Stream metrics
+     */
+    getMetrics() {
+        const uptimeMs = Date.now() - streamMetricsState.lastResetTime;
+        return {
+            activeStreams: streamMetricsState.activeStreams,
+            totalStreamsCompleted: streamMetricsState.totalStreamsCompleted,
+            totalChunksProcessed: streamMetricsState.totalChunksProcessed,
+            avgChunkProcessingTimeMs: Math.round(streamMetricsState.avgChunkProcessingTimeMs * 1000) / 1000,
+            peakActiveStreams: streamMetricsState.peakActiveStreams,
+            streamsPerMinute: uptimeMs > 0 ? (streamMetricsState.totalStreamsCompleted / (uptimeMs / 60000)).toFixed(2) : 0,
+            chunksPerSecond: uptimeMs > 0 ? (streamMetricsState.totalChunksProcessed / (uptimeMs / 1000)).toFixed(2) : 0
+        };
+    },
+
+    /**
+     * Reset stream metrics
+     */
+    reset() {
+        streamMetricsState.activeStreams = 0;
+        streamMetricsState.totalStreamsCompleted = 0;
+        streamMetricsState.totalChunksProcessed = 0;
+        streamMetricsState.totalProcessingTimeMs = 0;
+        streamMetricsState.avgChunkProcessingTimeMs = 0;
+        streamMetricsState.peakActiveStreams = 0;
+        streamMetricsState.lastResetTime = Date.now();
+    }
 };
 
 export default SystemMetrics;

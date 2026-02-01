@@ -1469,14 +1469,12 @@ export class ProviderPoolManager {
                 if (healthCheckModel) {
                     updates.lastHealthCheckModel = healthCheckModel;
                 }
-                if (!resetUsageCount) {
-                    updates.lastUsed = provider.config.lastUsed;
-                }
-                this._persistProviderUpdate(providerType, providerConfig.uuid, updates).catch(err => {
-                    this._log('error', `Async provider update failed: ${err.message}`);
-                });
             } else {
-                this._debouncedSave(providerType);
+                // For File Storage, reduce I/O by only saving periodically based on usage count
+                // or if we are resetting counters (significant state change)
+                if (resetUsageCount || provider.config.usageCount % 50 === 0) {
+                    this._debouncedSave(providerType);
+                }
             }
         }
     }

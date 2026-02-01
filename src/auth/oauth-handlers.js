@@ -1762,24 +1762,57 @@ async function buildCredentialCache(dirPath, concurrencyLimit = 10) {
  * @returns {Promise<{isDuplicate: boolean, existingUuid?: string}>} 检查结果
  */
 export async function checkKiroCredentialsDuplicate(refreshToken, provider = 'claude-kiro-oauth') {
-    if (!isStorageInitialized()) {
-        console.warn(`${KIRO_OAUTH_CONFIG.logPrefix} Storage not initialized, skipping duplicate check`);
-        return { isDuplicate: false };
-    }
-
-    try {
-        const storage = getStorageAdapter();
-        const result = await storage.checkKiroRefreshTokenExists(refreshToken);
-
-        if (result.isDuplicate) {
-            console.log(`${KIRO_OAUTH_CONFIG.logPrefix} Found duplicate refreshToken, existing UUID: ${result.existingUuid}`);
+    // 1. Try Redis Storage first (fastest and most accurate for Redis users)
+    if (isStorageInitialized()) {
+        try {
+            const storage = getStorageAdapter();
+            // Only use storage check if it's Redis (File adapter doesn't implement it)
+            if (storage.getType() === 'redis') {
+                const result = await storage.checkKiroRefreshTokenExists(refreshToken);
+                if (result.isDuplicate) {
+                    console.log(`${KIRO_OAUTH_CONFIG.logPrefix} Found duplicate refreshToken (Redis), existing UUID: ${result.existingUuid}`);
+                }
+                return result;
+            }
+        } catch (error) {
+            console.warn(`${KIRO_OAUTH_CONFIG.logPrefix} Storage check failed:`, error.message);
         }
+    }
 
-        return result;
-    } catch (error) {
-        console.warn(`${KIRO_OAUTH_CONFIG.logPrefix} Error checking duplicates:`, error.message);
+    // 2. Fallback to Memory Cache + File Scan (for File Storage users)
+    // This optimization prevents O(N^2) file scanning behavior during imports
+    const now = Date.now();
+
+    // Check memory cache
+    if (now - cacheLastUpdated < CACHE_TTL) {
+        if (credentialCache.has(refreshToken)) {
+            return {
+                isDuplicate: true,
+                existingPath: credentialCache.get(refreshToken)
+            };
+        }
         return { isDuplicate: false };
     }
+
+    // Cache expired or empty, rebuild it
+    // console.log(`${KIRO_OAUTH_CONFIG.logPrefix} Rebuilding credential cache...`);
+    credentialCache.clear();
+    
+    const kiroDir = path.join(process.cwd(), 'configs', 'kiro');
+    if (fs.existsSync(kiroDir)) {
+        await buildCredentialCache(kiroDir);
+    }
+    
+    cacheLastUpdated = now;
+
+    if (credentialCache.has(refreshToken)) {
+        return {
+            isDuplicate: true,
+            existingPath: credentialCache.get(refreshToken)
+        };
+    }
+
+    return { isDuplicate: false };
 }
 
 /**
