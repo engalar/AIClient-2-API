@@ -592,8 +592,26 @@ class RedisConfigManager extends StorageAdapter {
      * @returns {Promise<{success: boolean, queued: boolean, error?: string}>} Status indicating if operation succeeded
      */
     async addProvider(providerType, provider) {
-        // Invalidate cache
-        this._poolsCache = null;
+        // P1 Fix: Incremental cache update instead of full invalidation
+        // This prevents cache stampede under high concurrency
+        if (this._poolsCache) {
+            if (!this._poolsCache[providerType]) {
+                this._poolsCache[providerType] = [];
+            }
+            // Add to cache if not already present
+            const existingIndex = this._poolsCache[providerType].findIndex(p => p.uuid === provider.uuid);
+            if (existingIndex === -1) {
+                this._poolsCache[providerType].push(provider);
+            } else {
+                // Update existing entry
+                this._poolsCache[providerType][existingIndex] = provider;
+            }
+            this._poolsCacheTime = Date.now();
+        } else {
+            // Initialize cache with the new provider
+            this._poolsCache = { [providerType]: [provider] };
+            this._poolsCacheTime = Date.now();
+        }
 
         let redisSuccess = false;
         let redisError = null;
@@ -649,8 +667,15 @@ class RedisConfigManager extends StorageAdapter {
      * @returns {Promise<{queued: boolean}>} Status indicating if deletion was queued
      */
     async deleteProvider(providerType, uuid) {
-        // Invalidate cache
-        this._poolsCache = null;
+        // P1 Fix: Incremental cache update instead of full invalidation
+        // This prevents cache stampede under high concurrency
+        if (this._poolsCache && this._poolsCache[providerType]) {
+            const index = this._poolsCache[providerType].findIndex(p => p.uuid === uuid);
+            if (index !== -1) {
+                this._poolsCache[providerType].splice(index, 1);
+                this._poolsCacheTime = Date.now();
+            }
+        }
 
         let executeResult = { queued: false };
         try {
