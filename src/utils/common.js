@@ -190,7 +190,9 @@ export function formatExpiryLog(tag, expiryDate, nearMinutes) {
 /**
  * Reads the entire request body from an HTTP request.
  * 优化版本：使用数组存储chunks，避免字符串拼接导致的内存碎片
- * 使用 setImmediate 避免阻塞事件循环
+ * P2-2: 移除 setImmediate，直接同步解析 JSON
+ * 原因：setImmediate 增加 1-4ms 延迟，对于大多数请求得不偿失
+ * 现代 V8 的 JSON.parse 已经非常高效，同步解析更快
  * @param {http.IncomingMessage} req - The HTTP request object.
  * @param {number} maxSize - Maximum request body size in bytes (default: 10MB)
  * @returns {Promise<Object>} A promise that resolves with the parsed JSON request body.
@@ -222,18 +224,10 @@ export function getRequestBody(req, maxSize = 10 * 1024 * 1024) {
             try {
                 // 使用 Buffer.concat 而不是字符串拼接，避免内存碎片
                 const body = Buffer.concat(chunks).toString('utf8');
-
-                // 使用 setImmediate 将 JSON 解析放到下一个事件循环
-                // 避免阻塞当前事件循环，提升并发性能
-                setImmediate(() => {
-                    try {
-                        resolve(JSON.parse(body));
-                    } catch (error) {
-                        reject(new Error("Invalid JSON in request body: " + error.message));
-                    }
-                });
+                // P2-2: 直接同步解析，避免 setImmediate 带来的延迟
+                resolve(JSON.parse(body));
             } catch (error) {
-                reject(error);
+                reject(new Error("Invalid JSON in request body: " + error.message));
             }
         });
 
