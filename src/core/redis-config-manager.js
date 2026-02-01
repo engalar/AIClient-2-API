@@ -35,7 +35,9 @@ class RedisConfigManager extends StorageAdapter {
         this._usageCacheTime = 0;
         this._pluginsCache = null;
         this._pluginsCacheTime = 0;
-        this._cacheMaxAge = 5000; // 5 seconds cache TTL
+        // P1-3: Increase cache TTL from 5s to 30s to reduce Redis round-trips
+        // Can be overridden via options.cacheMaxAge
+        this._cacheMaxAge = options.cacheMaxAge ?? 30000; // 30 seconds cache TTL
 
         // Degraded mode flag - when true, rely on cache exclusively
         this._degradedMode = false;

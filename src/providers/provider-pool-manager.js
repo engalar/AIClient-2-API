@@ -1267,9 +1267,11 @@ export class ProviderPoolManager {
                 provider.config.errorCount++;
             }
 
-            provider.config.lastErrorTime = new Date().toISOString();
+            // P1-2: Reuse timestamp string to avoid creating multiple Date objects
+            const timestamp = new Date().toISOString();
+            provider.config.lastErrorTime = timestamp;
             // 更新 lastUsed 时间，避免因 LRU 策略导致失败节点被重复选中
-            provider.config.lastUsed = new Date().toISOString();
+            provider.config.lastUsed = timestamp;
 
             // 保存错误信息
             if (errorMessage) {
@@ -1320,10 +1322,12 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
+            // P1-2: Reuse timestamp string to avoid creating multiple Date objects
+            const timestamp = new Date().toISOString();
             provider.config.isHealthy = false;
             provider.config.errorCount = this.maxErrorCount; // Set to max to indicate definitive failure
-            provider.config.lastErrorTime = new Date().toISOString();
-            provider.config.lastUsed = new Date().toISOString();
+            provider.config.lastErrorTime = timestamp;
+            provider.config.lastUsed = timestamp;
 
             if (errorMessage) {
                 provider.config.lastErrorMessage = errorMessage;
@@ -1367,10 +1371,12 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
+            // P1-2: Reuse timestamp string to avoid creating multiple Date objects
+            const timestamp = new Date().toISOString();
             provider.config.isHealthy = false;
             provider.config.errorCount = this.maxErrorCount; // Set to max to indicate definitive failure
-            provider.config.lastErrorTime = new Date().toISOString();
-            provider.config.lastUsed = new Date().toISOString();
+            provider.config.lastErrorTime = timestamp;
+            provider.config.lastUsed = timestamp;
 
             if (errorMessage) {
                 provider.config.lastErrorMessage = errorMessage;
