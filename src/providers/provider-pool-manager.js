@@ -1457,17 +1457,27 @@ export class ProviderPoolManager {
                 this._updateHealthStatusAtomic(providerType, providerConfig.uuid, true).catch(err => {
                     this._log('error', `Async health status update failed: ${err.message}`);
                 });
-                const updates = {
-                    errorCount: 0,
-                    refreshCount: 0,
-                    needsRefresh: false,
-                    lastErrorTime: null,
-                    lastErrorMessage: null,
-                    lastHealthCheckTime: provider.config.lastHealthCheckTime,
-                    usageCount: provider.config.usageCount
-                };
-                if (healthCheckModel) {
-                    updates.lastHealthCheckModel = healthCheckModel;
+                // P5 Optimization: Persist to Redis every 10 usages (vs every request before)
+                // Redis writes are cheap but still add latency; periodic saves balance accuracy vs performance
+                if (resetUsageCount || provider.config.usageCount % 10 === 0) {
+                    const updates = {
+                        errorCount: 0,
+                        refreshCount: 0,
+                        needsRefresh: false,
+                        lastErrorTime: null,
+                        lastErrorMessage: null,
+                        lastHealthCheckTime: provider.config.lastHealthCheckTime,
+                        usageCount: provider.config.usageCount
+                    };
+                    if (healthCheckModel) {
+                        updates.lastHealthCheckModel = healthCheckModel;
+                    }
+                    if (!resetUsageCount) {
+                        updates.lastUsed = provider.config.lastUsed;
+                    }
+                    this._persistProviderUpdate(providerType, providerConfig.uuid, updates).catch(err => {
+                        this._log('error', `Async provider update failed: ${err.message}`);
+                    });
                 }
             } else {
                 // For File Storage, reduce I/O by only saving periodically based on usage count
