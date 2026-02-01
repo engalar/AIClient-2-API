@@ -23,5 +23,6 @@ bin/
 *.out
 vendor/
 coverage.out
+coverage/
 /kiro-server
 
