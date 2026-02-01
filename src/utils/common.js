@@ -5,11 +5,15 @@ import * as crypto from 'crypto'; // Import crypto for MD5 hashing
 import { convertData, getOpenAIStreamChunkStop } from '../convert/convert.js';
 import { ProviderStrategyFactory } from './provider-strategies.js';
 import { getPluginManager } from '../core/plugin-manager.js';
+import { getCachedServiceManager } from './import-cache.js';
 
 // P1-9补充: 缓存序列化的 stop chunk，避免每次流式响应都重新序列化
 // 添加大小限制防止内存泄漏（最多缓存 100 个模型的 stop chunk）
 const stopChunkCache = new Map();
 const STOP_CHUNK_CACHE_MAX_SIZE = 100;
+
+// P0-3: Export cached service manager getter for testing
+export const _getServiceManagerCached = getCachedServiceManager;
 
 // ==================== 网络错误处理 ====================
 
@@ -470,13 +474,13 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             await new Promise(resolve => setTimeout(resolve, randomDelay));
             
             try {
-                // 动态导入以避免循环依赖
-                const { getApiServiceWithFallback } = await import('../services/service-manager.js');
+                // P0-3: 使用缓存的导入，避免热路径中重复动态导入
+                const { getApiServiceWithFallback } = await getCachedServiceManager();
                 const result = await getApiServiceWithFallback(CONFIG, model);
-                
+
                 if (result && result.service && result.uuid !== pooluuid) {
                     console.log(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
-                    
+
                     // 使用新服务重试
                     const newRetryContext = {
                         ...retryContext,
@@ -484,7 +488,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         currentRetry: currentRetry + 1,
                         maxRetries
                     };
-                    
+
                     // 递归调用，使用新的服务
                     return await handleStreamRequest(
                         res,
@@ -600,7 +604,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         if (shouldSwitchCredential && !credentialMarkedUnhealthy) {
             credentialMarkedUnhealthy = true; // 触发下面的重试逻辑
         }
-        
+
         // 凭证已被标记为不健康后，尝试切换到新凭证重试
         // 不再依赖状态码判断，只要凭证被标记不健康且可以重试，就尝试切换
         if (credentialMarkedUnhealthy && currentRetry < maxRetries && providerPoolManager && CONFIG) {
@@ -608,15 +612,15 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
             const randomDelay = Math.floor(Math.random() * 10000); // 0-10000毫秒
             console.log(`[Unary Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
             await new Promise(resolve => setTimeout(resolve, randomDelay));
-            
+
             try {
-                // 动态导入以避免循环依赖
-                const { getApiServiceWithFallback } = await import('../services/service-manager.js');
+                // P0-3: 使用缓存的导入，避免热路径中重复动态导入
+                const { getApiServiceWithFallback } = await getCachedServiceManager();
                 const result = await getApiServiceWithFallback(CONFIG, model);
-                
+
                 if (result && result.service && result.uuid !== pooluuid) {
                     console.log(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
-                    
+
                     // 使用新服务重试
                     const newRetryContext = {
                         ...retryContext,
@@ -624,7 +628,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                         currentRetry: currentRetry + 1,
                         maxRetries
                     };
-                    
+
                     // 递归调用，使用新的服务
                     return await handleUnaryRequest(
                         res,
